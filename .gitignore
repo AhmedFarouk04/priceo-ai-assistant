@@ -1,0 +1,11 @@
+.env
+.env.local
+.env.*.local
+*.log
+*-results.json
+test-results.json
+test-response.json
+coverage
+.vercel
+.next
+node_modules
