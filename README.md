@@ -35,7 +35,3 @@ ALLOW_DEBUG=false
 ## Deployment
 
 This project is intended to be deployed on Vercel.
-
-```
-
-```
