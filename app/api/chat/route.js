@@ -1,5 +1,9 @@
 // Handles the main assistant chat API endpoint and assistant flow.
-import { ALLOW_DEBUG, APP_ENV } from "../../../lib/config/env.js";
+import {
+  ALLOW_DEBUG,
+  APP_ENV,
+  USE_AI_INTENT_PARSER,
+} from "../../../lib/config/env.js";
 import { detectIntent } from "../../../lib/assistant/detectIntent.js";
 import {
   validateCreateComplaintPendingAction,
@@ -14,6 +18,7 @@ import {
 } from "../../../lib/assistant/intentConfig.js";
 import { normalizeDataForAnswer } from "../../../lib/assistant/normalizeData.js";
 import { routeIntent } from "../../../lib/assistant/router.js";
+import { parseIntentWithAI } from "../../../lib/openai/parseIntent.js";
 import { generateAnswer } from "../../../lib/openai/generateAnswer.js";
 import {
   createComplaint,
@@ -27,7 +32,7 @@ import {
   normalizeApplyCouponResult,
 } from "../../../lib/tools/cartTool.js";
 
-function buildComplaintPreview(subject, includeAnswer = true) {
+function buildComplaintPreview(subject, includeAnswer = true, parsedIntent = null) {
   const response = {
     ok: true,
     intent: "create_complaint",
@@ -38,6 +43,10 @@ function buildComplaintPreview(subject, includeAnswer = true) {
     },
   };
 
+  if (parsedIntent) {
+    response.parsedIntent = parsedIntent;
+  }
+
   if (includeAnswer) {
     response.answer = `هسجل الشكوى بالنص ده: ${subject}. أكدلي التنفيذ؟`;
   }
@@ -45,7 +54,7 @@ function buildComplaintPreview(subject, includeAnswer = true) {
   return response;
 }
 
-function buildCouponPreview(coupon, includeAnswer = true) {
+function buildCouponPreview(coupon, includeAnswer = true, parsedIntent = null) {
   const response = {
     ok: true,
     intent: "apply_coupon",
@@ -55,6 +64,10 @@ function buildCouponPreview(coupon, includeAnswer = true) {
       coupon,
     },
   };
+
+  if (parsedIntent) {
+    response.parsedIntent = parsedIntent;
+  }
 
   if (includeAnswer) {
     response.answer = `هطبق كوبون ${coupon} على السلة. أكدلي التنفيذ؟`;
@@ -95,7 +108,11 @@ function extractNotificationSendTo(message = "") {
   return "";
 }
 
-function buildNotificationPreview({ subject, sendTo }, includeAnswer = true) {
+function buildNotificationPreview(
+  { subject, sendTo },
+  includeAnswer = true,
+  parsedIntent = null
+) {
   const response = {
     ok: true,
     intent: "send_notification",
@@ -106,6 +123,10 @@ function buildNotificationPreview({ subject, sendTo }, includeAnswer = true) {
       sendTo,
     },
   };
+
+  if (parsedIntent) {
+    response.parsedIntent = parsedIntent;
+  }
 
   if (includeAnswer) {
     response.answer = `هتتبعت رسالة ${sendTo === "ALL" ? "لكل المستخدمين" : "للمستهدفين"} بالنص ده: ${subject}. التنفيذ الحقيقي غير مفعّل حاليًا.`;
@@ -148,6 +169,29 @@ function buildInvalidApplyCouponResponse() {
     },
       { status: 502 }
     );
+}
+
+function isAllowedIntent(intent) {
+  return [
+    "product_search",
+    "product_details",
+    "policy_question",
+    "user_orders",
+    "order_details",
+    "cart",
+    "wishlist",
+    "user_notifications",
+    "admin_orders_stats",
+    "admin_sales_statistics",
+    "admin_notifications",
+    "admin_complaints",
+    "admin_coupons",
+    "coupon_details",
+    "create_complaint",
+    "apply_coupon",
+    "send_notification",
+    "unknown",
+  ].includes(intent);
 }
 
 function detectDominantLanguage(text) {
@@ -350,6 +394,36 @@ export async function POST(request) {
       }
     }
 
+    let parsedIntent = null;
+    let parserFallback = false;
+    let parserError = "";
+    let intent = "unknown";
+    let params = {};
+
+    if (confirmAction !== true) {
+      if (USE_AI_INTENT_PARSER) {
+        try {
+          const parsed = await parseIntentWithAI({ message, role });
+          if (parsed && parsed.intent !== "unknown" && isAllowedIntent(parsed.intent)) {
+            parsedIntent = parsed;
+            intent = parsed.intent;
+            params = parsed.params || {};
+          } else {
+            throw new Error("Invalid parser output.");
+          }
+        } catch (error) {
+          parserFallback = true;
+          parserError = error?.message || "Intent parser failed.";
+          parsedIntent = null;
+          intent = detectIntent(message, role);
+          params = {};
+        }
+      } else {
+        intent = detectIntent(message, role);
+        params = {};
+      }
+    }
+
     if (confirmAction === true && pendingAction?.type === "apply_coupon") {
       if (!validateApplyCouponPendingAction(pendingAction)) {
         return Response.json(
@@ -375,7 +449,7 @@ export async function POST(request) {
       const coupon = getCouponFromAction(message, pendingAction);
 
       if (debug === true) {
-        return Response.json(buildCouponPreview(coupon, false));
+        return Response.json(buildCouponPreview(coupon, false, parsedIntent));
       }
 
       try {
@@ -439,8 +513,6 @@ export async function POST(request) {
       });
     }
 
-    const intent = detectIntent(message, role);
-
     if (intent === "send_notification") {
       if (role !== "admin") {
         return Response.json(
@@ -456,8 +528,8 @@ export async function POST(request) {
         );
       }
 
-      const subject = extractNotificationSubject(message);
-      const sendTo = extractNotificationSendTo(message);
+      const subject = params?.subject || extractNotificationSubject(message);
+      const sendTo = params?.sendTo || extractNotificationSendTo(message);
 
       if (!subject || !isValidNotificationSubject(subject)) {
         return Response.json({
@@ -478,7 +550,9 @@ export async function POST(request) {
       }
 
       if (debug === true) {
-        return Response.json(buildNotificationPreview({ subject, sendTo }, false));
+        return Response.json(
+          buildNotificationPreview({ subject, sendTo }, false, parsedIntent)
+        );
       }
 
       if (confirmAction === true) {
@@ -509,7 +583,7 @@ export async function POST(request) {
         );
       }
 
-      const coupon = extractCartCouponCode(message);
+      const coupon = params?.coupon || extractCartCouponCode(message);
 
       if (!coupon) {
         return Response.json({
@@ -530,11 +604,11 @@ export async function POST(request) {
       }
 
       if (debug === true) {
-        return Response.json(buildCouponPreview(coupon, false));
+        return Response.json(buildCouponPreview(coupon, false, parsedIntent));
       }
 
       if (confirmAction !== true) {
-        return Response.json(buildCouponPreview(coupon, true));
+        return Response.json(buildCouponPreview(coupon, true, parsedIntent));
       }
 
       if (!pendingAction || pendingAction.type !== "apply_coupon") {
@@ -584,7 +658,7 @@ export async function POST(request) {
         );
       }
 
-      const subject = getComplaintSubjectFromAction(message, pendingAction);
+      const subject = params?.subject || getComplaintSubjectFromAction(message, pendingAction);
 
       if (!subject || subject.length < 5) {
         return Response.json({
@@ -596,11 +670,11 @@ export async function POST(request) {
       }
 
       if (debug === true) {
-        return Response.json(buildComplaintPreview(subject, false));
+        return Response.json(buildComplaintPreview(subject, false, parsedIntent));
       }
 
       if (confirmAction !== true) {
-        return Response.json(buildComplaintPreview(subject, true));
+        return Response.json(buildComplaintPreview(subject, true, parsedIntent));
       }
 
       if (!pendingAction || pendingAction.type !== "create_complaint") {
@@ -655,17 +729,28 @@ export async function POST(request) {
     // fetch(url, { headers: { authorization: token } })
     // Never trust role alone for sensitive actions; Priceo APIs validate token server-side.
 
-    const routed = await routeIntent({ intent, message, role, token });
+    const routed = await routeIntent({ intent, message, role, token, params });
     const normalizedData = normalizeDataForAnswer({ intent, data: routed.data });
 
     if (debug === true) {
-      return Response.json({
+      const response = {
         ok: true,
         intent,
         source: routed.source,
         rawData: routed.data,
         normalizedData,
-      });
+      };
+
+      if (parsedIntent) {
+        response.parsedIntent = parsedIntent;
+      }
+
+      if (parserFallback) {
+        response.parserFallback = true;
+        response.parserError = parserError;
+      }
+
+      return Response.json(response);
     }
 
     let answer;
