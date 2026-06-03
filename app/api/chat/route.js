@@ -346,6 +346,13 @@ function buildFallbackAnswer({ intent, data, userMessage }) {
   return text;
 }
 
+function buildUnknownScopeAnswer(userMessage) {
+  const isArabic = detectDominantLanguage(userMessage) === "Arabic";
+  return isArabic
+    ? "عذرًا، أستطيع المساعدة فقط في المنتجات والطلبات وسياسات المتجر."
+    : "Sorry, I can only help with products, orders, and store policies.";
+}
+
 export async function POST(request) {
   try {
     const body = await request.json();
@@ -765,6 +772,15 @@ export async function POST(request) {
     }
 
     let answer;
+    if (intent === "unknown") {
+      answer = buildUnknownScopeAnswer(message);
+      return Response.json({
+        ok: true,
+        intent,
+        answer,
+      });
+    }
+
     try {
       answer = await generateAnswer({
         userMessage: message,
