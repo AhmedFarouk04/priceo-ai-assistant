@@ -753,6 +753,17 @@ export async function POST(request) {
       return Response.json(response);
     }
 
+    if (intent === "cart" && normalizedData?.hasCart === false) {
+      const isArabic = detectDominantLanguage(message) === "Arabic";
+      return Response.json({
+        ok: true,
+        intent: "cart",
+        answer: isArabic
+          ? "السلة فارغة حاليًا."
+          : "Your cart is empty right now.",
+      });
+    }
+
     let answer;
     try {
       answer = await generateAnswer({
