@@ -20,6 +20,7 @@ import { normalizeDataForAnswer } from "../../../lib/assistant/normalizeData.js"
 import { routeIntent } from "../../../lib/assistant/router.js";
 import { parseIntentWithAI } from "../../../lib/openai/parseIntent.js";
 import { generateAnswer } from "../../../lib/openai/generateAnswer.js";
+import { resolvePriceoAuthContext } from "../../../lib/priceo/authContext.js";
 import {
   createComplaint,
   extractComplaintSubject,
@@ -353,13 +354,28 @@ function buildUnknownScopeAnswer(userMessage) {
     : "Sorry, I can only help with products, orders, and store policies.";
 }
 
+function normalizeAuthorizationHeader(value) {
+  const headerValue = String(value || "").trim();
+  if (!headerValue) {
+    return "";
+  }
+
+  if (/^Bearer\s+/i.test(headerValue)) {
+    const rawToken = headerValue.replace(/^Bearer\s+/i, "").trim();
+    return rawToken && !/\s/.test(rawToken) ? rawToken : "";
+  }
+
+  return /\s/.test(headerValue) ? "" : headerValue;
+}
+
 export async function POST(request) {
   try {
+    const authToken = normalizeAuthorizationHeader(
+      request.headers.get("authorization")
+    );
     const body = await request.json();
     const {
       message,
-      role = "user",
-      token = "",
       debug = false,
       confirmAction = false,
       pendingAction = null,
@@ -371,12 +387,6 @@ export async function POST(request) {
         { status: 400 }
       );
     }
-    if (role !== "user" && role !== "admin") {
-      return Response.json(
-        { ok: false, error: "Invalid role. Role must be 'user' or 'admin'." },
-        { status: 400 }
-      );
-    }
 
     if (debug === true && APP_ENV === "production" && !ALLOW_DEBUG) {
       return Response.json(
@@ -384,6 +394,10 @@ export async function POST(request) {
         { status: 403 }
       );
     }
+
+    const authContext = await resolvePriceoAuthContext({ token: authToken });
+    const trustedRole = authContext.role || "user";
+    const trustedToken = authToken;
 
     if (confirmAction === true) {
       if (
@@ -410,7 +424,7 @@ export async function POST(request) {
     if (confirmAction !== true) {
       if (USE_AI_INTENT_PARSER) {
         try {
-          const parsed = await parseIntentWithAI({ message, role });
+          const parsed = await parseIntentWithAI({ message, role: trustedRole });
           if (parsed && parsed.intent !== "unknown" && isAllowedIntent(parsed.intent)) {
             parsedIntent = parsed;
             intent = parsed.intent;
@@ -422,11 +436,11 @@ export async function POST(request) {
           parserFallback = true;
           parserError = error?.message || "Intent parser failed.";
           parsedIntent = null;
-          intent = detectIntent(message, role);
+          intent = detectIntent(message, trustedRole);
           params = {};
         }
       } else {
-        intent = detectIntent(message, role);
+        intent = detectIntent(message, trustedRole);
         params = {};
       }
     }
@@ -439,14 +453,7 @@ export async function POST(request) {
         );
       }
 
-      if (role !== "user") {
-        return Response.json(
-          { ok: false, error: "User role is required for this intent." },
-          { status: 403 }
-        );
-      }
-
-      if (!token) {
+      if (!trustedToken) {
         return Response.json(
           { ok: false, error: "Authentication token is required for this intent." },
           { status: 401 }
@@ -461,7 +468,7 @@ export async function POST(request) {
 
       try {
         const cart = await applyCoupon({
-          token,
+          token: trustedToken,
           coupon,
         });
         const normalizedCart = normalizeApplyCouponResult(cart);
@@ -493,7 +500,7 @@ export async function POST(request) {
         );
       }
 
-      if (!token) {
+      if (!trustedToken) {
         return Response.json(
           { ok: false, error: "Authentication token is required for this intent." },
           { status: 401 }
@@ -507,7 +514,7 @@ export async function POST(request) {
       }
 
       const complaint = await createComplaint({
-        token,
+        token: trustedToken,
         subject,
       });
 
@@ -521,17 +528,17 @@ export async function POST(request) {
     }
 
     if (intent === "send_notification") {
-      if (role !== "admin") {
-        return Response.json(
-          { ok: false, error: "Admin role is required for this intent." },
-          { status: 403 }
-        );
-      }
-
-      if (!token) {
+      if (!trustedToken) {
         return Response.json(
           { ok: false, error: "Authentication token is required for this intent." },
           { status: 401 }
+        );
+      }
+
+      if (trustedRole !== "admin") {
+        return Response.json(
+          { ok: false, error: "Admin role is required for this intent." },
+          { status: 403 }
         );
       }
 
@@ -576,14 +583,7 @@ export async function POST(request) {
     }
 
     if (intent === "apply_coupon") {
-      if (role !== "user") {
-        return Response.json(
-          { ok: false, error: "User role is required for this intent." },
-          { status: 403 }
-        );
-      }
-
-      if (!token) {
+      if (!trustedToken) {
         return Response.json(
           { ok: false, error: "Authentication token is required for this intent." },
           { status: 401 }
@@ -634,7 +634,7 @@ export async function POST(request) {
 
       try {
         const cart = await applyCoupon({
-          token,
+          token: trustedToken,
           coupon: pendingAction.coupon || coupon,
         });
 
@@ -658,7 +658,7 @@ export async function POST(request) {
     }
 
     if (intent === "create_complaint") {
-      if (!token) {
+      if (!trustedToken) {
         return Response.json(
           { ok: false, error: "Authentication token is required for this intent." },
           { status: 401 }
@@ -692,7 +692,7 @@ export async function POST(request) {
       }
 
       const complaint = await createComplaint({
-        token,
+        token: trustedToken,
         subject: pendingAction.subject || subject,
       });
 
@@ -705,7 +705,7 @@ export async function POST(request) {
       });
     }
 
-    if (protectedUserIntents.has(intent) && !token) {
+    if (protectedUserIntents.has(intent) && !trustedToken) {
       return Response.json(
         { ok: false, error: "Authentication token is required for this intent." },
         { status: 401 }
@@ -713,16 +713,17 @@ export async function POST(request) {
     }
 
     if (adminIntents.has(intent)) {
-      if (role !== "admin") {
-        return Response.json(
-          { ok: false, error: "Admin role is required for this intent." },
-          { status: 403 }
-        );
-      }
-      if (!token) {
+      if (!trustedToken) {
         return Response.json(
           { ok: false, error: "Authentication token is required for admin intents." },
           { status: 401 }
+        );
+      }
+
+      if (trustedRole !== "admin") {
+        return Response.json(
+          { ok: false, error: "Admin role is required for this intent." },
+          { status: 403 }
         );
       }
     }
@@ -736,7 +737,13 @@ export async function POST(request) {
     // fetch(url, { headers: { authorization: token } })
     // Never trust role alone for sensitive actions; Priceo APIs validate token server-side.
 
-    const routed = await routeIntent({ intent, message, role, token, params });
+    const routed = await routeIntent({
+      intent,
+      message,
+      role: trustedRole,
+      token: trustedToken,
+      params,
+    });
     const normalizedData = normalizeDataForAnswer({ intent, data: routed.data });
 
     if (debug === true) {
@@ -786,7 +793,7 @@ export async function POST(request) {
         userMessage: message,
         intent,
         data: normalizedData,
-        role,
+        role: trustedRole,
       });
     } catch {
       answer = buildFallbackAnswer({
